@@ -56,6 +56,21 @@
       <version>${avro-version}</version>
       <scope>compile</scope>
     </dependency>
+    <dependency>
+    	<groupId>com.continuent.tungsten-commons</groupId>
+    	<artifactId>tungsten-fsm</artifactId>
+    	<version>0.4.0</version>
+    </dependency>
+    <dependency>
+    	<groupId>org.slf4j</groupId>
+    	<artifactId>slf4j-simple</artifactId>
+    	<version>1.6.2</version>
+    </dependency>
+    <dependency>
+    	<groupId>com.google.guava</groupId>
+    	<artifactId>guava</artifactId>
+    	<version>11.0.2</version>
+    </dependency>
   </dependencies>
 
   <build>
