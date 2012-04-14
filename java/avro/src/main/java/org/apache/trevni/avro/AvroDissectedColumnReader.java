@@ -18,25 +18,27 @@
 
 package org.apache.trevni.avro;
 
-import java.io.IOException;
 import java.io.Closeable;
 import java.io.File;
+import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.ListIterator;
 import java.util.Map;
-import java.util.HashMap;
 
-import org.apache.trevni.ColumnMetaData;
+import org.apache.avro.Schema;
+import org.apache.avro.generic.GenericData;
 import org.apache.trevni.ColumnFileReader;
+import org.apache.trevni.ColumnMetaData;
 import org.apache.trevni.ColumnValues;
 import org.apache.trevni.Input;
 import org.apache.trevni.InputFile;
 import org.apache.trevni.TrevniRuntimeException;
-
-import org.apache.avro.Schema;
-import org.apache.avro.generic.GenericData;
-
+import org.apache.trevni.avro.AvroDissectedColumnator.ColumnPath;
+import org.apache.trevni.avro.AvroDissectedColumnator.ColumnPathElement;
+import org.apache.trevni.avro.AvroDissectedColumnator.DissectedColumnMetaData;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -46,14 +48,16 @@ import com.continuent.tungsten.commons.patterns.fsm.EntityAdapter;
 import com.continuent.tungsten.commons.patterns.fsm.Event;
 import com.continuent.tungsten.commons.patterns.fsm.EventTypeGuard;
 import com.continuent.tungsten.commons.patterns.fsm.Guard;
+import com.continuent.tungsten.commons.patterns.fsm.RegexGuard;
 import com.continuent.tungsten.commons.patterns.fsm.State;
 import com.continuent.tungsten.commons.patterns.fsm.StateChangeListener;
 import com.continuent.tungsten.commons.patterns.fsm.StateMachine;
 import com.continuent.tungsten.commons.patterns.fsm.StateTransitionMap;
 import com.continuent.tungsten.commons.patterns.fsm.StateType;
-import com.continuent.tungsten.commons.patterns.fsm.StringEvent;
 import com.continuent.tungsten.commons.patterns.fsm.Transition;
 import com.continuent.tungsten.commons.patterns.fsm.TransitionRollbackException;
+import com.google.common.base.Joiner;
+import com.google.common.base.Splitter;
 
 /** Read files written with {@link AvroColumnWriter}.  A subset of the schema
  * used for writing may be specified when reading.  In this case only columns
@@ -67,14 +71,13 @@ public class AvroDissectedColumnReader<D>
   private Schema readSchema;
   
   private ColumnValues[] values;
-  private HashMap<String, Integer> readerColumnNumbers;
-  private int column;                          // current index in values
+  private int currentColumnValuesIndex;
+  private List<DissectedColumnMetaData> readColumnMetaData;
  
   // Monitoring and management
   private static Logger logger = LoggerFactory.getLogger(AvroDissectedColumnReader.class);
   
   // State machine
-  private StateTransitionMap stmap = null;
   private StateMachine sm = null;  
 
   /** Parameters for reading an Avro column file. */
@@ -130,70 +133,127 @@ public class AvroDissectedColumnReader<D>
     // create iterator for each column in readSchema
     AvroDissectedColumnator readColumnator = new AvroDissectedColumnator(readSchema);
     ColumnMetaData[] readColumns = readColumnator.getColumns();
-    this.values = new ColumnValues[readColumns.length];
-    this.readerColumnNumbers = new HashMap<String, Integer>();
+    values = new ColumnValues[readColumns.length];
     int j = 0;    
     for (ColumnMetaData c : readColumns) {
       Integer n = fileColumnNumbers.get(c.getName());
       if (n == null)
         throw new TrevniRuntimeException("No column named: "+c.getName());
-      this.readerColumnNumbers.put(c.getName(), j);
       values[j++] = reader.getValues(n);
     }
     
     // create state machine for record assembly
-    this.stmap = new StateTransitionMap();
-
+    readColumnMetaData = readColumnator.getDissectedColumns();  
+    StateTransitionMap stmap = new StateTransitionMap();
+    
     // State for between rows
     State rowReady = new State("ROWREADY", StateType.START);
-    this.stmap.addState(rowReady);
+    stmap.addState(rowReady);
     
     // State for each column    
     ArrayList<State> colStates = new ArrayList<State>();
-    for (ColumnMetaData col : readColumns) {
-      String colName = col.getName();
-      State colState = new State(colName, StateType.ACTIVE);
+    for (int k = 0; k < readColumnMetaData.size(); k++) {
+      State colState = new State(String.valueOf(k), StateType.ACTIVE);
       colStates.add(colState);
-      this.stmap.addState(colState);
+      stmap.addState(colState);
     }
     
     // End state
     State end = new State("END", StateType.END);
-    this.stmap.addState(end);   
-    
+    stmap.addState(end);
+
     // Define guards
     Guard newRowGuard = new EventTypeGuard(NewRowEvent.class);
-    Guard stopGuard = new EventTypeGuard(StopEvent.class);
-    Guard stringGuard = new EventTypeGuard(StringEvent.class);
-    
+    Guard stopGuard = new EventTypeGuard(StopEvent.class);    
+
     // Define actions
     Action logAction = new LogAction();
-    Action nullAction = new NullAction();
-
+    Action nullAction = new NullAction(); 
+    
     // Define transitions
-    stmap.addTransition(new Transition("ROWREADY-TO-" + colStates.get(0).getBaseName(),
-        newRowGuard, rowReady, logAction, colStates.get(0)));    
-    while (colStatesIterator.hasNext()) {
-      State colState = colStatesIterator.next();
-
-      // send each column to the next, except send the last column to ROWREADY
-      if (colStatesIterator.nextIndex() == colStates.size()) {
-        this.stmap.addTransition(new Transition(colState.getBaseName() + "-TO-ROWREADY",
-            stringGuard, colState, nullAction, rowReady));
-      } else {
-        State nextColState = colStates.get(colStatesIterator.nextIndex());
-        this.stmap.addTransition(new Transition(colState.getBaseName() + "-TO-" + nextColState.getBaseName(),
-            stringGuard, colState, logAction, nextColState));      
+    stmap.addTransition(new Transition("ROWREADY-TO-0", newRowGuard, rowReady, nullAction, colStates.get(0)));
+    stmap.addTransition(new Transition("ROWREADY-TO-END", stopGuard, rowReady, nullAction, end));        
+    
+    ListIterator<DissectedColumnMetaData> colIterator = readColumnMetaData.listIterator();
+    while (colIterator.hasNext()) {
+      DissectedColumnMetaData col = colIterator.next();
+      int colIndex = readColumnMetaData.indexOf(col);
+      
+      // maxLevel
+      int maxLevel = col.getPath().getRepSize();
+      HashMap<Integer, Transition> transitions = new HashMap<Integer, Transition>();
+      
+      // barrier, barrierLevel
+      // default values (used for last column)
+      int barrierLevel = 0; // I think?
+      State barrier = end;
+      if (colIterator.nextIndex() < readColumnMetaData.size()) {
+        barrier = colStates.get(colIterator.nextIndex());
+        barrierLevel = getCommonAncestorLevel(readColumnMetaData.get(colIndex).getPath(), 
+            readColumnMetaData.get(colIndex + 1).getPath(), true);
+      }
+      
+      // transitions
+      for (DissectedColumnMetaData preCol : readColumnMetaData.subList(0, colIndex + 1)) {
+        int preColIndex = readColumnMetaData.indexOf(preCol); 
+        if (preCol.getPath().getRepSize() > barrierLevel) {
+          int backLevel = getCommonAncestorLevel(readColumnMetaData.get(colIndex).getPath(), 
+              readColumnMetaData.get(preColIndex).getPath(), true);
+          if (backLevel > 0 && !transitions.containsKey(backLevel)) {
+            Transition backTransition = new Transition(
+                new RegexGuard(String.valueOf(backLevel)),
+                colStates.get(colIndex),
+                nullAction,
+                colStates.get(preColIndex));
+            transitions.put(backLevel, backTransition);            
+          }
+        }
+      }
+      for (int l = barrierLevel + 1; l <= maxLevel; l++) {
+        if (!transitions.containsKey(l)) {
+          transitions.put(l, transitions.get(l - 1));
+        }
+      }      
+      for (int m = 0; m <= barrierLevel; m++) {
+        if (!transitions.containsKey(m)) {
+          Transition barrierTransition = new Transition(
+              new RegexGuard(String.valueOf(m)),
+              colStates.get(colIndex),
+              nullAction,
+              barrier);
+          transitions.put(m, barrierTransition);
+        }
+      }
+      
+      // Add the transitions to the FSM
+      for (Transition transition : transitions.values()) {
+        stmap.addTransition(transition);
       }
     }
-    this.stmap.addTransition(new Transition("ROWREADY-TO-END", stopGuard, rowReady, nullAction, end));
     
     // Create the state machine
-    stmap.build();
+    stmap.build();    
     sm = new StateMachine(stmap, new EntityAdapter(this));
     sm.addListener(this);
-  }
+  }  
 
+  private int getCommonAncestorLevel(ColumnPath path1, ColumnPath path2, boolean rep) {
+    int commonLevel = 0;
+    Iterator<ColumnPathElement> pathIterator1;
+    Iterator<ColumnPathElement> pathIterator2;
+    if (rep) {
+      pathIterator1 = path1.getRepPath().iterator();
+      pathIterator2 = path2.getRepPath().iterator();
+    } else {
+      pathIterator1 = path1.iterator();
+      pathIterator2 = path2.iterator();
+    }
+    while (pathIterator1.hasNext() && pathIterator2.hasNext() && pathIterator1.next() == pathIterator2.next()) {
+      commonLevel++;
+    }
+    return commonLevel; 
+  }
+  
   @Override
   public Iterator<D> iterator() { return this; }
 
@@ -205,25 +265,29 @@ public class AvroDissectedColumnReader<D>
   @Override
   public D next() {
     try {
-      this.sm.applyEvent(new NewRowEvent());
+      sm.applyEvent(new NewRowEvent());
       for (int i = 0; i < values.length; i++)
         values[i].startRow();
-      this.column = 0;
-      return (D)read(this.readSchema);
+      currentColumnValuesIndex = 0;
+      return (D)read(readSchema);
     } catch (Exception e) {
       throw new TrevniRuntimeException(e);
     }
   }
 
   private Object read(Schema s) throws Exception {
-    Object record = this.model.newRecord(null, s);    
+    Object record = model.newRecord(null, s);
+    currentColumnValuesIndex = 0;
+    int lastReader = 0;
     while (sm.getState().getBaseName() != "ROWREADY") {
-      String name = this.sm.getState().getBaseName();
-      int position = this.column;
-      Object value = this.values[this.column].nextValue();
-
-      model.setField(record, name, position, value);
-      this.sm.applyEvent(new StringEvent((String)value));
+      String name = readColumnMetaData.get(currentColumnValuesIndex).getColumn().getName(); 
+      String valueTriple = (String)values[currentColumnValuesIndex].nextValue();
+      ArrayList<String> values = new ArrayList<String>();
+      for (String t : Splitter.on(",").trimResults().split(valueTriple)) {
+        values.add(t);
+      }      
+      model.setField(record, name, currentColumnValuesIndex, values.get(0));
+      sm.applyEvent(new Event(values.get(1)));
     }
     return record;
   }
@@ -241,36 +305,32 @@ public class AvroDissectedColumnReader<D>
     logger.info("State changed: " + oldState.getName() + " -> " + newState.getName());
   }
 
-  class NewRowEvent extends Event
-  {
+  // Do nothing
+  class NullAction implements Action {
+    public void doAction(Event event, Entity entity, Transition transition,
+        int actionType) throws TransitionRollbackException {
+    }
+  }
+  
+  // Log event data
+  class LogAction implements Action {
+    public void doAction(Event event, Entity entity, Transition transition,
+                         int actionType) throws TransitionRollbackException {
+      logger.info("Event: " + event.getData());
+    }
+  }  
+  
+  class NewRowEvent extends Event {
     public NewRowEvent()
     {
       super(null);
     }
   }  
   
-  class StopEvent extends Event
-  {
+  class StopEvent extends Event {
     public StopEvent()
     {
       super(null);
     }
   }
-
-  // Do nothing
-  class NullAction implements Action {
-    public void doAction(Event event, Entity entity, Transition transition,
-                         int actionType) throws TransitionRollbackException {
-    }
-  }
-
-  // Log event data
-  class LogAction implements Action {
-    public void doAction(Event event, Entity entity, Transition transition,
-                         int actionType) throws TransitionRollbackException {
-      logger.info("Event: " + event.getData());
-      column = readerColumnNumbers.get(transition.getOutput().getBaseName());
-    }
-  }  
-
 }
