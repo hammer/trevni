@@ -17,23 +17,24 @@
  */
 package org.apache.trevni.avro;
 
-import java.io.IOException;
+import static org.apache.trevni.avro.AvroColumnator.isSimple;
+
 import java.io.File;
+import java.io.IOException;
 import java.io.OutputStream;
 import java.util.Collection;
-import java.util.Map;
-
-import org.apache.trevni.ColumnFileMetaData;
-import org.apache.trevni.ColumnFileWriter;
-import org.apache.trevni.TrevniRuntimeException;
+import java.util.Iterator;
+import java.util.List;
 
 import org.apache.avro.Schema;
 import org.apache.avro.Schema.Field;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericFixed;
 import org.apache.avro.util.Utf8;
+import org.apache.trevni.ColumnFileMetaData;
+import org.apache.trevni.ColumnFileWriter;
 
-import static org.apache.trevni.avro.AvroColumnator.isSimple;
+import com.google.common.base.Joiner;
 
 /** Write Avro records to a Trevni column file.  Each primitive type is written
  * to a separate column. */
@@ -41,7 +42,6 @@ public class AvroDissectedColumnWriter<D> {
   private Schema schema;
   private GenericData model;
   private ColumnFileWriter writer;
-  private int[] arrayWidths;
 
   public static final String SCHEMA_KEY = "avro.schema";
 
@@ -53,10 +53,9 @@ public class AvroDissectedColumnWriter<D> {
   public AvroDissectedColumnWriter(Schema s, ColumnFileMetaData meta, GenericData model)
     throws IOException {
     this.schema = s;
-    AvroColumnator columnator = new AvroColumnator(s);
+    AvroDissectedColumnator columnator = new AvroDissectedColumnator(s);
     meta.set(SCHEMA_KEY, s.toString());           // save schema in file
     this.writer = new ColumnFileWriter(meta, columnator.getColumns());
-    this.arrayWidths = columnator.getArrayWidths();
     this.model = model;
   }
 
@@ -73,66 +72,106 @@ public class AvroDissectedColumnWriter<D> {
   /** Add a row to the file. */
   public void write(D value) throws IOException {
     writer.startRow();
-    int count = write(value, schema, 0);
+    int count = write(value, schema, 0, 0, 0, 0);
     assert(count == writer.getColumnCount());
     writer.endRow();
   }
   
-  private int write(Object o, Schema s, int column) throws IOException {
+  private int write(Object o, Schema s, int column, int r, int rDepth, int d) throws IOException {
     if (isSimple(s)) {
-      writeValue(o, s, column);
-      return column+1;
+      // 1. (S, Rq)
+      if (o != null) {
+        writeValue(Joiner.on(",").join(o, r, d), s, column);
+      } else {
+        writeValue(Joiner.on(",").join("NULL", r, d), s, column);
+      }
+      return column + 1;
     }
     switch (s.getType()) {
     case MAP: 
-      Map<?,?> map = (Map)o;
-      writer.writeLength(map.size(), column);
-      for (Map.Entry e : map.entrySet()) {
-        writer.writeValue(null, column);
-        writer.writeValue(e.getKey(), column+1);
-        int c = write(e.getValue(), s.getValueType(), column+2);
-        assert(c == column+arrayWidths[column]);
+      throw new RuntimeException("Can't dissect maps: " + s);
+    case RECORD:
+      // 2. (M, Rq)
+      if (o != null) {
+        for (Field f : s.getFields())
+          column = write(model.getField(o, f.name(), f.pos()), f.schema(), column, r, rDepth, d);
+      } else {
+        for (Field f : s.getFields())
+          column = write(null, f.schema(), column, r, rDepth, d);      
       }
-      return column+arrayWidths[column];
-    case RECORD: 
-      for (Field f : s.getFields())
-        column = write(model.getField(o,f.name(),f.pos()), f.schema(), column);
       return column;
-    case ARRAY: 
-      Collection elements = (Collection)o;
-      writer.writeLength(elements.size(), column);
-      if (isSimple(s.getElementType())) {         // optimize simple arrays
-        for (Object element : elements)
-          writeValue(element, s.getElementType(), column);
-        return column+1;
-      }
-      for (Object element : elements) {
-        writer.writeValue(null, column);
-        int c = write(element, s.getElementType(), column+1);
-        assert(c == column+arrayWidths[column]);
-      }
-      return column+arrayWidths[column];
-    case UNION:
-      int b = model.resolveUnion(s, o);
-      int i = 0;
-      for (Schema branch : s.getTypes()) {
-        boolean selected = i++ == b;
-        if (!selected) {
-          writer.writeLength(0, column);
-          column+=arrayWidths[column];
-        } else {
-          writer.writeLength(1, column);
-          if (isSimple(branch)) {
-            writeValue(o, branch, column++);
+    case ARRAY:
+      if (o != null) {
+        Collection elements = (Collection)o;
+        // 3. (S, Rp)
+        if (isSimple(s.getElementType())) {
+          if (elements.size() == 0) {
+            writeValue(Joiner.on(",").join("NULL", r, d), s.getElementType(), column);
           } else {
-            writer.writeValue(null, column);
-            column = write(o, branch, column+1);
+            d += 1;
+            rDepth += 1;
+            Iterator<Object> iter = elements.iterator();
+            writeValue(Joiner.on(",").join(iter.next(), r, d), s.getElementType(), column);
+            while (iter.hasNext()) {
+              writeValue(Joiner.on(",").join(iter.next(), rDepth, d), s.getElementType(), column);
+            }
+          }
+          return column + 1;
+        }
+        // 4. (M, Rp)
+        if (elements.size() == 0) {
+          column = write(null, s.getElementType(), column, r, rDepth, d);
+          return column;
+        } else {
+          d += 1;
+          rDepth += 1;
+          Iterator<Object> iter = elements.iterator();
+          int c = write(iter.next(), s.getElementType(), column, r, rDepth, d);
+          while (iter.hasNext()) {
+            write(iter.next(), s.getElementType(), column, rDepth, rDepth, d);
+          }
+          return c;
+        }
+      } else {
+        column = write(null, s.getElementType(), column, r, rDepth, d);
+      }
+    case UNION:
+      if (o != null) {
+        int b = model.resolveUnion(s, o);
+        List<Schema> branches = s.getTypes();
+        Schema chosenBranch = branches.get(b);
+        Schema notChosenBranch = branches.get(1 - b); // only two branches
+        if (chosenBranch.getType() != Schema.Type.NULL) {
+          if (isSimple(chosenBranch)) {
+            // 5a. (S, O)
+            writeValue(Joiner.on(",").join(o, r, d + 1), chosenBranch, column);
+            return column + 1;
+          } else {
+            // 6a. (M, O)
+            return write(o, chosenBranch, column, r, rDepth, d + 1);
+          }
+        } else {
+          if (isSimple(notChosenBranch)) {
+            // 5b. (S, O)
+            writeValue(Joiner.on(",").join("NULL", r, d), notChosenBranch, column);
+            return column + 1;
+          } else {
+            // 6b. (M, O)
+            column = write(null, notChosenBranch, column, r, rDepth, d);
+            return column;
+          }
+        }
+      } else {
+        List<Schema> branches = s.getTypes();
+        for (Schema branch : branches) {
+          if (branch.getType() != Schema.Type.NULL) {
+            column = write(null, branch, column, r, rDepth, d);
+            return column;
           }
         }
       }
-      return column;
     default:
-      throw new TrevniRuntimeException("Unknown schema: "+s);
+      throw new RuntimeException("Unknown schema: " + s);
     }
   }
 
