@@ -27,6 +27,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.ListIterator;
 import java.util.Map;
+import java.util.Stack;
 
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericData;
@@ -266,8 +267,10 @@ public class AvroDissectedColumnReader<D>
   public D next() {
     try {
       sm.applyEvent(new NewRowEvent());
-      for (int i = 0; i < values.length; i++)
+      for (int i = 0; i < values.length; i++) {
         values[i].startRow();
+        values[i].nextValue(); // first repetition level is not used
+      }
       currentColumnValuesIndex = 0;
       return (D)read(readSchema);
     } catch (Exception e) {
@@ -276,20 +279,77 @@ public class AvroDissectedColumnReader<D>
   }
 
   private Object read(Schema s) throws Exception {
-    Object record = model.newRecord(null, s);
+    RecordInAssembly record = new RecordInAssembly(s);
     currentColumnValuesIndex = 0;
-    int lastReader = 0;
+    int lastColumnValuesIndex = 0;    
     while (sm.getState().getBaseName() != "ROWREADY") {
-      String name = readColumnMetaData.get(currentColumnValuesIndex).getColumn().getName(); 
-      String valueTriple = (String)values[currentColumnValuesIndex].nextValue();
-      ArrayList<String> values = new ArrayList<String>();
-      for (String t : Splitter.on(",").trimResults().split(valueTriple)) {
-        values.add(t);
-      }      
-      model.setField(record, name, currentColumnValuesIndex, values.get(0));
-      sm.applyEvent(new Event(values.get(1)));
+      // 1. Read in next value; if it's not null, synchronize record and add value; if it's NULL, synchronize record
+      String value = (String)values[currentColumnValuesIndex].nextValue();
+      if (!value.equals("NULL")) {
+        record.moveToLevel(lastColumnValuesIndex, currentColumnValuesIndex, 
+            readColumnMetaData.get(currentColumnValuesIndex).getPath().size());
+        record.addValue(readColumnMetaData.get(currentColumnValuesIndex).getColumn().getName(), value);
+      } else {
+        record.moveToLevel(lastColumnValuesIndex, currentColumnValuesIndex, 
+            readColumnMetaData.get(currentColumnValuesIndex).getPath().size());
+      }
+      
+      // 2. Advance the FSM using the repetition level of the next value
+      // TODO(hammer): return repetition level 0 if you reach the end of the column
+      String repLevel = (String)values[currentColumnValuesIndex].nextValue();
+      sm.applyEvent(new Event(repLevel));
+      lastColumnValuesIndex = currentColumnValuesIndex;
+      currentColumnValuesIndex = Integer.valueOf(sm.getState().getBaseName());
+      
+      // 3. Synchronize record in assembly
+      record.returnToLevel(lastColumnValuesIndex, readColumnMetaData.get(currentColumnValuesIndex).getPath().size());      
     }
     return record;
+  }
+  
+  class RecordInAssembly {
+    private Schema s;
+    private Stack<Record> records;
+    
+    RecordInAssembly(Schema s) {
+      this.s = s;
+      this.records = new Stack<Record>();
+      records.push(new Record(model.newRecord(null, s)));
+    }
+    
+    void addValue(String name, String value) {
+      Record record = records.peek();
+      model.setField(record.getRecord(), name, record.getCurrentField(), value);
+    }
+    
+    int moveToLevel(int lastReader, int newReader, int newLevel) {
+      int ancestorLevel = getCommonAncestorLevel(
+          readColumnMetaData.get(newReader).getPath(),
+          readColumnMetaData.get(lastReader).getPath(), false);
+      return 0;
+    }
+    
+    int returnToLevel(int lastReader, int newLevel) {
+      return 0;
+    }
+    
+    class Record {
+      private Object record;
+      private int currentField;
+      
+      Record(Object record) {
+        this.record = record;
+        this.currentField = 0;
+      }
+      
+      Object getRecord() {
+        return record;
+      }
+      
+      int getCurrentField() {
+        return currentField;
+      }
+    }
   }
   
   @Override

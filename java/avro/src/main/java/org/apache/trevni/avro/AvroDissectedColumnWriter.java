@@ -35,6 +35,7 @@ import org.apache.trevni.ColumnFileMetaData;
 import org.apache.trevni.ColumnFileWriter;
 
 import com.google.common.base.Joiner;
+import com.google.common.base.Splitter;
 
 /** Write Avro records to a Trevni column file.  Each primitive type is written
  * to a separate column. */
@@ -193,7 +194,21 @@ public class AvroDissectedColumnWriter<D> {
       value = ((GenericFixed)value).bytes();
       break;
     }
-    writer.writeValue(value, column);
+    int i = 0;
+    String r = "";
+    String v = "";
+    for (String item : Splitter.on(",").split((String)value)) {
+      if (i == 0) {       
+        v = item;  
+      } else if (i == 1) {
+        r = item;
+        break;
+      }
+      i++;
+    }
+    // Write repetition level, then the value
+    writer.writeValue(r, column);
+    writer.writeValue(v, column);
   }
 
 }
