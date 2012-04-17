@@ -18,6 +18,8 @@
 
 package org.apache.trevni.avro;
 
+import static org.apache.trevni.avro.AvroColumnator.isSimple;
+
 import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
@@ -30,6 +32,7 @@ import java.util.Map;
 import java.util.Stack;
 
 import org.apache.avro.Schema;
+import org.apache.avro.Schema.Field;
 import org.apache.avro.generic.GenericData;
 import org.apache.trevni.ColumnFileReader;
 import org.apache.trevni.ColumnMetaData;
@@ -113,10 +116,8 @@ public class AvroDissectedColumnReader<D>
     this.reader = new ColumnFileReader(params.input);
     this.model = params.model;
     Schema.Parser p = new Schema.Parser();
-    // set fileSchema to readSchema for now
+    this.fileSchema = p.parse(reader.getMetaData().getString(AvroColumnWriter.SCHEMA_KEY));
     this.readSchema = params.schema == null ? fileSchema : params.schema;
-    //this.fileSchema = p.parse(reader.getMetaData().getString(AvroColumnWriter.SCHEMA_KEY));
-    this.fileSchema = this.readSchema;
     initialize();
   }
 
@@ -204,7 +205,7 @@ public class AvroDissectedColumnReader<D>
             Transition backTransition = new Transition(
                 new RegexGuard(String.valueOf(backLevel)),
                 colStates.get(colIndex),
-                nullAction,
+                logAction,
                 colStates.get(preColIndex));
             transitions.put(backLevel, backTransition);            
           }
@@ -220,7 +221,7 @@ public class AvroDissectedColumnReader<D>
           Transition barrierTransition = new Transition(
               new RegexGuard(String.valueOf(m)),
               colStates.get(colIndex),
-              nullAction,
+              logAction,
               barrier);
           transitions.put(m, barrierTransition);
         }
@@ -282,29 +283,36 @@ public class AvroDissectedColumnReader<D>
     RecordInAssembly record = new RecordInAssembly(s);
     currentColumnValuesIndex = 0;
     int lastColumnValuesIndex = 0;    
-    while (sm.getState().getBaseName() != "ROWREADY") {
+    while (sm.getState().getBaseName() != "ROWREADY" && sm.getState().getBaseName() != "END") {
       // 1. Read in next value; if it's not null, synchronize record and add value; if it's NULL, synchronize record
       String value = (String)values[currentColumnValuesIndex].nextValue();
       if (!value.equals("NULL")) {
-        record.moveToLevel(lastColumnValuesIndex, currentColumnValuesIndex, 
-            readColumnMetaData.get(currentColumnValuesIndex).getPath().size());
+        record.moveToLevel(lastColumnValuesIndex, currentColumnValuesIndex);
         record.addValue(readColumnMetaData.get(currentColumnValuesIndex).getColumn().getName(), value);
       } else {
-        record.moveToLevel(lastColumnValuesIndex, currentColumnValuesIndex, 
-            readColumnMetaData.get(currentColumnValuesIndex).getPath().size());
+        record.moveToLevel(lastColumnValuesIndex, currentColumnValuesIndex);
+        record.addNull();
       }
       
-      // 2. Advance the FSM using the repetition level of the next value
-      // TODO(hammer): return repetition level 0 if you reach the end of the column
-      String repLevel = (String)values[currentColumnValuesIndex].nextValue();
+      // 2. Advance the FSM using the repetition level of the next value      
+      String repLevel = null;
+      try {
+        repLevel = (String)values[currentColumnValuesIndex].nextValue();
+      } catch (IOException e) {
+        repLevel = "0"; // use repetition level 0 at end of column
+      }
       sm.applyEvent(new Event(repLevel));
       lastColumnValuesIndex = currentColumnValuesIndex;
-      currentColumnValuesIndex = Integer.valueOf(sm.getState().getBaseName());
+      if (sm.getState().getBaseName() != "ROWREADY" && sm.getState().getBaseName() != "END") {
+        currentColumnValuesIndex = Integer.valueOf(sm.getState().getBaseName());
+      }
       
       // 3. Synchronize record in assembly
-      record.returnToLevel(lastColumnValuesIndex, readColumnMetaData.get(currentColumnValuesIndex).getPath().size());      
+      record.returnToLevel(lastColumnValuesIndex);      
     }
-    return record;
+    // ReturnToLevel 0
+    // End all nested records
+    return record.getRootRecord();
   }
   
   class RecordInAssembly {
@@ -317,24 +325,55 @@ public class AvroDissectedColumnReader<D>
       records.push(new Record(model.newRecord(null, s)));
     }
     
-    void addValue(String name, String value) {
-      Record record = records.peek();
-      model.setField(record.getRecord(), name, record.getCurrentField(), value);
+    public Object getRootRecord() {
+      return records.get(0).getRecord(); 
     }
     
-    int moveToLevel(int lastReader, int newReader, int newLevel) {
+    void addValue(String name, Object value) {
+      Record record = records.peek();
+      model.setField(record.getRecord(), name, record.getCurrentField(), value);
+      record.incrementCurrentField();
+    }
+    
+    void addNull() {
+      Record record = records.peek();
+      record.incrementCurrentField();
+    }
+    
+    void moveToLevel(int lastReader, int newReader) {
+      // 0. Find common ancestor level
       int ancestorLevel = getCommonAncestorLevel(
           readColumnMetaData.get(newReader).getPath(),
           readColumnMetaData.get(lastReader).getPath(), false);
+      
+      // 1. End nested records
+      for (int i = records.size() - 1; i > ancestorLevel; i--) {
+        Record completedRecord = records.pop();
+        addValue(completedRecord.name, completedRecord);
+      }
+      
+      // 2. Start nested records
+      for (int j = ancestorLevel; j < readColumnMetaData.get(newReader).getPath().size() - 1; j++) {
+        // Get name
+        String name = readColumnMetaData.get(newReader).getPath().get(j).getFieldName();
+        
+        // Get schema
+        Schema newSchema = pathToSchema(readColumnMetaData.get(newReader).getPath(), s, j);
+        
+        // Create the record
+        records.push(new Record(model.newRecord(null, newSchema), name));
+      }
+    }
+    
+    int returnToLevel(int lastReader) {
+      // End nested records
       return 0;
     }
     
-    int returnToLevel(int lastReader, int newLevel) {
-      return 0;
-    }
-    
+    // Need name for each field; comes from ColumnPath, not Schema
     class Record {
       private Object record;
+      private String name;
       private int currentField;
       
       Record(Object record) {
@@ -342,14 +381,52 @@ public class AvroDissectedColumnReader<D>
         this.currentField = 0;
       }
       
-      Object getRecord() {
+      Record(Object record, String name) {
+        this(record);
+        this.name = name;
+      }
+      
+      public Object getRecord() {
         return record;
       }
       
-      int getCurrentField() {
+      public int getCurrentField() {
         return currentField;
       }
+      
+      public int incrementCurrentField() {
+        return ++currentField;
+      }
+      
+      public String toString() {
+        return record.toString();
+      }
     }
+  }
+  
+  private Schema pathToSchema(ColumnPath p, Schema s, int level) {
+    ColumnPathElement e = null;
+    Schema nextSchema = null;
+    int i = 0;
+    while (i <= level) {
+      e = p.get(i);
+      if (e.isOptional()) {
+        nextSchema = s.getField(e.getFieldName()).schema();
+        for (Schema branch : nextSchema.getTypes()) {
+          if (branch.getType() != Schema.Type.NULL) {
+            nextSchema = branch;
+            i++;
+            break;
+          }
+        }
+      } else if (e.isRepeated()) {
+        nextSchema = s.getField(e.getFieldName()).schema().getElementType();
+      } else {
+        nextSchema = s.getField(e.getFieldName()).schema();
+      }
+      i++;
+    }
+    return nextSchema;
   }
   
   @Override
