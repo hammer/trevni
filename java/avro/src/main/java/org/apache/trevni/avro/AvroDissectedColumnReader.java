@@ -1,5 +1,4 @@
 /**
- * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -18,8 +17,6 @@
 
 package org.apache.trevni.avro;
 
-import static org.apache.trevni.avro.AvroColumnator.isSimple;
-
 import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
@@ -32,7 +29,6 @@ import java.util.Map;
 import java.util.Stack;
 
 import org.apache.avro.Schema;
-import org.apache.avro.Schema.Field;
 import org.apache.avro.generic.GenericData;
 import org.apache.trevni.ColumnFileReader;
 import org.apache.trevni.ColumnMetaData;
@@ -60,8 +56,6 @@ import com.continuent.tungsten.commons.patterns.fsm.StateTransitionMap;
 import com.continuent.tungsten.commons.patterns.fsm.StateType;
 import com.continuent.tungsten.commons.patterns.fsm.Transition;
 import com.continuent.tungsten.commons.patterns.fsm.TransitionRollbackException;
-import com.google.common.base.Joiner;
-import com.google.common.base.Splitter;
 
 /** Read files written with {@link AvroColumnWriter}.  A subset of the schema
  * used for writing may be specified when reading.  In this case only columns
@@ -188,7 +182,7 @@ public class AvroDissectedColumnReader<D>
       // barrier, barrierLevel
       // default values (used for last column)
       int barrierLevel = 0; // I think?
-      State barrier = end;
+      State barrier = rowReady;
       if (colIterator.nextIndex() < readColumnMetaData.size()) {
         barrier = colStates.get(colIterator.nextIndex());
         barrierLevel = getCommonAncestorLevel(readColumnMetaData.get(colIndex).getPath(), 
@@ -213,9 +207,15 @@ public class AvroDissectedColumnReader<D>
       }
       for (int l = barrierLevel + 1; l <= maxLevel; l++) {
         if (!transitions.containsKey(l)) {
-          transitions.put(l, transitions.get(l - 1));
+          Transition oldTransition = transitions.get(l - 1);  
+          Transition newTransition = new Transition(
+              new RegexGuard(String.valueOf(l)),
+              oldTransition.getInput(),
+              oldTransition.getAction(),
+              oldTransition.getOutput());
+          transitions.put(l, newTransition);
         }
-      }      
+      }  
       for (int m = 0; m <= barrierLevel; m++) {
         if (!transitions.containsKey(m)) {
           Transition barrierTransition = new Transition(
@@ -225,7 +225,7 @@ public class AvroDissectedColumnReader<D>
               barrier);
           transitions.put(m, barrierTransition);
         }
-      }
+      }    
       
       // Add the transitions to the FSM
       for (Transition transition : transitions.values()) {
@@ -237,6 +237,12 @@ public class AvroDissectedColumnReader<D>
     stmap.build();    
     sm = new StateMachine(stmap, new EntityAdapter(this));
     sm.addListener(this);
+         
+    // Throw away first repetition level (not used)
+    for (int n = 0; n < values.length; n++) {
+      values[n].startRow();
+      values[n].nextValue();
+    }
   }  
 
   private int getCommonAncestorLevel(ColumnPath path1, ColumnPath path2, boolean rep) {
@@ -262,16 +268,12 @@ public class AvroDissectedColumnReader<D>
   @Override
   public boolean hasNext() {
     return values[0].hasNext();
-  }
-
+  } 
+  
   @Override
   public D next() {
     try {
       sm.applyEvent(new NewRowEvent());
-      for (int i = 0; i < values.length; i++) {
-        values[i].startRow();
-        values[i].nextValue(); // first repetition level is not used
-      }
       currentColumnValuesIndex = 0;
       return (D)read(readSchema);
     } catch (Exception e) {
@@ -283,19 +285,16 @@ public class AvroDissectedColumnReader<D>
     RecordInAssembly record = new RecordInAssembly(s);
     currentColumnValuesIndex = 0;
     int lastColumnValuesIndex = 0;    
-    while (sm.getState().getBaseName() != "ROWREADY" && sm.getState().getBaseName() != "END") {
-      // 1. Read in next value; if it's not null, synchronize record and add value; if it's NULL, synchronize record
+    while (sm.getState().getBaseName() != "ROWREADY") {
+      // 1. Read in next value, synchronize the record, and add value
       String value = (String)values[currentColumnValuesIndex].nextValue();
-      if (!value.equals("NULL")) {
-        record.moveToLevel(lastColumnValuesIndex, currentColumnValuesIndex);
-        record.addValue(readColumnMetaData.get(currentColumnValuesIndex).getColumn().getName(), value);
-      } else {
-        record.moveToLevel(lastColumnValuesIndex, currentColumnValuesIndex);
-        record.addNull();
-      }
-      
+      record.moveToLevel(lastColumnValuesIndex, currentColumnValuesIndex);
+      // TODO(hammer): handle NULL values correctly
+      record.addValue(value);
+            
       // 2. Advance the FSM using the repetition level of the next value      
       String repLevel = null;
+      // TODO(hammer): replace try/catch with hasNext(), when I figure out why hasNext() doesn't work
       try {
         repLevel = (String)values[currentColumnValuesIndex].nextValue();
       } catch (IOException e) {
@@ -303,15 +302,14 @@ public class AvroDissectedColumnReader<D>
       }
       sm.applyEvent(new Event(repLevel));
       lastColumnValuesIndex = currentColumnValuesIndex;
-      if (sm.getState().getBaseName() != "ROWREADY" && sm.getState().getBaseName() != "END") {
+      if (sm.getState().getBaseName() != "ROWREADY") {
         currentColumnValuesIndex = Integer.valueOf(sm.getState().getBaseName());
-      }
-      
-      // 3. Synchronize record in assembly
-      record.returnToLevel(lastColumnValuesIndex);      
+      }      
+      // 3. Synchronize record in assembly (necessary?)
     }
     // ReturnToLevel 0
     // End all nested records
+    record.returnToRoot();
     return record.getRootRecord();
   }
   
@@ -319,7 +317,7 @@ public class AvroDissectedColumnReader<D>
     private Schema s;
     private Stack<Record> records;
     
-    RecordInAssembly(Schema s) {
+    public RecordInAssembly(Schema s) {
       this.s = s;
       this.records = new Stack<Record>();
       records.push(new Record(model.newRecord(null, s)));
@@ -329,73 +327,122 @@ public class AvroDissectedColumnReader<D>
       return records.get(0).getRecord(); 
     }
     
-    void addValue(String name, Object value) {
-      Record record = records.peek();
-      model.setField(record.getRecord(), name, record.getCurrentField(), value);
-      record.incrementCurrentField();
+    public void addValue(Object value) {
+      records.peek().addValue(value);
     }
     
-    void addNull() {
-      Record record = records.peek();
-      record.incrementCurrentField();
-    }
-    
-    void moveToLevel(int lastReader, int newReader) {
-      // 0. Find common ancestor level
-      int ancestorLevel = getCommonAncestorLevel(
-          readColumnMetaData.get(newReader).getPath(),
-          readColumnMetaData.get(lastReader).getPath(), false);
+    public void moveToLevel(int lastReader, int nextReader) {
+      // 0. Get paths
+      ColumnPath lastPath = readColumnMetaData.get(lastReader).getPath();
+      ColumnPath nextPath = readColumnMetaData.get(nextReader).getPath();
       
-      // 1. End nested records
-      for (int i = records.size() - 1; i > ancestorLevel; i--) {
+      // 1. Find common ancestor level
+      int ancestorLevel = getCommonAncestorLevel(lastPath, nextPath, false);
+      
+      // 2. End nested records
+      // End the current field
+      if (lastReader != nextReader) {
+        records.peek().endField();
+      }
+      // Move up the IR
+      for (int i = lastPath.size() - 1; i > ancestorLevel; i--) {
         Record completedRecord = records.pop();
-        addValue(completedRecord.name, completedRecord);
+        records.peek().addValue(completedRecord);
+        records.peek().endField();
+      }
+      // If we're moving to the left on the IR, pop a record
+      if (lastReader > nextReader) {
+        // Add the completed record to the array
+        Record completedRecord = records.pop();
+        records.peek().addValue(completedRecord);
+        
+        // Create a new record
+        SchemaAndRepeatedStatus ancestorField = pathToSchema(nextPath, s, ancestorLevel - 1);
+        records.push(new Record(model.newRecord(null, ancestorField.getSchema())));
       }
       
-      // 2. Start nested records
-      for (int j = ancestorLevel; j < readColumnMetaData.get(newReader).getPath().size() - 1; j++) {
-        // Get name
-        String name = readColumnMetaData.get(newReader).getPath().get(j).getFieldName();
-        
-        // Get schema
-        Schema newSchema = pathToSchema(readColumnMetaData.get(newReader).getPath(), s, j);
-        
-        // Create the record
-        records.push(new Record(model.newRecord(null, newSchema), name));
+      // 3. Start nested records
+      // Move down the IR
+      for (int j = ancestorLevel; j < nextPath.size() - 1; j++) {
+        SchemaAndRepeatedStatus newField = pathToSchema(nextPath, s, j);
+        String fieldName = nextPath.get(j).getFieldName();
+        Schema fieldSchema = newField.getSchema();
+        if (newField.isRepeated()) {
+          records.peek().startField(fieldName, fieldSchema);
+        } else {
+          records.peek().startField(fieldName);
+        }
+        records.push(new Record(model.newRecord(null, newField.getSchema())));        
+      }
+      // Initialize the field that will be written to next
+      // TODO(hammer): handle the case where initial field is an array
+      if (lastReader != nextReader) {
+        SchemaAndRepeatedStatus newField = pathToSchema(nextPath, s, nextPath.size() - 1);
+        String fieldName = nextPath.get(nextPath.size() - 1).getFieldName();
+        Schema fieldSchema = newField.getSchema();
+        if (newField.isRepeated()) {
+          records.peek().startField(fieldName, fieldSchema);
+        } else {
+          records.peek().startField(fieldName);
+        }      
       }
     }
     
-    int returnToLevel(int lastReader) {
-      // End nested records
-      return 0;
+    public void returnToRoot() {
+      // End the current field
+      records.peek().endField();
+
+      // Move up the IR
+      for (int i = records.size() - 1; i > 0; i--) {
+        Record completedRecord = records.pop();
+        records.peek().addValue(completedRecord); 
+        records.peek().endField();
+      }
     }
     
-    // Need name for each field; comes from ColumnPath, not Schema
     class Record {
       private Object record;
-      private String name;
-      private int currentField;
+      private int currentFieldIndex;
+      private boolean currentFieldIsRepeated;
+      private ArrayList<Object> currentFieldArray;
+      private Schema currentFieldArraySchema;
+      private String fieldName;
       
       Record(Object record) {
         this.record = record;
-        this.currentField = 0;
-      }
-      
-      Record(Object record, String name) {
-        this(record);
-        this.name = name;
+        this.currentFieldIndex = 0;
       }
       
       public Object getRecord() {
         return record;
       }
       
-      public int getCurrentField() {
-        return currentField;
+      public void startField(String fieldName) {
+        this.fieldName = fieldName;
+        currentFieldIsRepeated = false;
       }
       
-      public int incrementCurrentField() {
-        return ++currentField;
+      public void startField(String fieldName, Schema currentFieldArraySchema) {
+        this.fieldName = fieldName;
+        currentFieldIsRepeated = true;
+        this.currentFieldArraySchema = currentFieldArraySchema;
+        currentFieldArray = new ArrayList<Object>();
+      }
+      
+      public void addValue(Object value) {
+        if (currentFieldIsRepeated) {
+          currentFieldArray.add(value);
+        } else {          
+          model.setField(record, fieldName, currentFieldIndex, value);
+        }
+      }
+      
+      public void endField() {
+        if (currentFieldIsRepeated) {
+          model.setField(record, fieldName, currentFieldIndex, 
+              new GenericData.Array<Object>(Schema.createArray(currentFieldArraySchema), currentFieldArray));
+        }
+        currentFieldIndex++;
       }
       
       public String toString() {
@@ -404,29 +451,46 @@ public class AvroDissectedColumnReader<D>
     }
   }
   
-  private Schema pathToSchema(ColumnPath p, Schema s, int level) {
+  class SchemaAndRepeatedStatus {
+    private Schema s;
+    private boolean isRepeated;
+    
+    public SchemaAndRepeatedStatus(Schema s, boolean isRepeated) {
+      this.s = s;
+      this.isRepeated = isRepeated;
+    }
+    
+    public Schema getSchema() {
+      return s;
+    }
+    
+    public boolean isRepeated() {
+      return isRepeated;
+    }
+  }
+  
+  private SchemaAndRepeatedStatus pathToSchema(ColumnPath p, Schema s, int level) {
     ColumnPathElement e = null;
-    Schema nextSchema = null;
+    Schema nextSchema = s;
     int i = 0;
     while (i <= level) {
       e = p.get(i);
       if (e.isOptional()) {
-        nextSchema = s.getField(e.getFieldName()).schema();
+        nextSchema = nextSchema.getField(e.getFieldName()).schema();
         for (Schema branch : nextSchema.getTypes()) {
           if (branch.getType() != Schema.Type.NULL) {
             nextSchema = branch;
-            i++;
-            break;
           }
         }
       } else if (e.isRepeated()) {
-        nextSchema = s.getField(e.getFieldName()).schema().getElementType();
+        nextSchema = nextSchema.getField(e.getFieldName()).schema().getElementType();
       } else {
-        nextSchema = s.getField(e.getFieldName()).schema();
+        nextSchema = nextSchema.getField(e.getFieldName()).schema();
       }
       i++;
     }
-    return nextSchema;
+        
+    return new SchemaAndRepeatedStatus(nextSchema, e.isRepeated());
   }
   
   @Override
